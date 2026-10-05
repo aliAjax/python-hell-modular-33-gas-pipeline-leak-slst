@@ -58,7 +58,7 @@ def normalize_create(payload):
         raise DomainError("invalid_odor_reports", "异味报告数不能为负数")
     reporter = require_text(payload, "reporter")
     stable_key = "%s|%s|%s" % (pipeline_id, segment_id, reported_at)
-    return {
+    result = {
         "pipeline_id": pipeline_id,
         "segment_id": segment_id,
         "reported_at": reported_at,
@@ -71,6 +71,12 @@ def normalize_create(payload):
         "hazards_clear": False,
         "_stable_key": stable_key,
     }
+    region = payload.get("region")
+    if region is not None:
+        if not isinstance(region, str) or not region.strip():
+            raise DomainError("invalid_region", "region 必须是非空字符串")
+        result["region"] = region.strip()
+    return result
 
 
 def normalize_source(payload):

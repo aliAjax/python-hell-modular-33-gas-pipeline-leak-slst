@@ -50,6 +50,8 @@ def build_handler(service, static_dir):
                     return self._send(200, {"status": "ok"})
                 if path == "/api/state":
                     return self._send(200, service.state())
+                if path == "/api/valves":
+                    return self._send(200, service.valve_ledger())
                 if path == "/api/items":
                     return self._send(200, {"items": service.list_items()})
                 parts = [part for part in path.split("/") if part]

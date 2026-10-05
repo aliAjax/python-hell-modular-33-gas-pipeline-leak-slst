@@ -2,6 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
+from . import rules
 from .audit import audit_hash, canonical_json
 from .domain import ConflictError, NotFoundError, DomainError
 
@@ -69,6 +70,15 @@ class Repository:
                     previous_hash TEXT NOT NULL,
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS valve_ledger (
+                    valve_id TEXT PRIMARY KEY,
+                    owner_item_id INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    released_at TEXT,
+                    released_by_item INTEGER,
+                    FOREIGN KEY(owner_item_id) REFERENCES items(id)
                 );
                 """
             )
@@ -207,7 +217,7 @@ class Repository:
         finally:
             conn.close()
 
-    def apply_action(self, item_id, action, actor, role, new_status, new_payload, event_payload, expected_version=None):
+    def apply_action(self, item_id, action, actor, role, new_status, new_payload, event_payload, expected_version=None, ledger=None):
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -221,19 +231,124 @@ class Repository:
                 "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
                 (new_status, version, canonical_json(new_payload), now_iso(), item_id),
             )
+            ledger_result = None
+            if ledger:
+                if ledger["kind"] == "isolate":
+                    ledger_result = self._apply_isolation(conn, item_id, ledger["valves"])
+                elif ledger["kind"] == "restore":
+                    ledger_result = self._apply_restore(conn, item_id, ledger["valves"])
+                if ledger_result is not None:
+                    event_payload = dict(event_payload)
+                    event_payload["ledger"] = ledger_result
             conn.execute(
                 "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
                 (item_id, action, actor, role, canonical_json(event_payload), now_iso()),
             )
             self.append_audit(conn, item_id, action, actor, role, event_payload)
             conn.execute("COMMIT")
-            return self.get_item(item_id)
+            return ledger_result
         except Exception:
             try:
                 conn.execute("ROLLBACK")
             except sqlite3.Error:
                 pass
             raise
+        finally:
+            conn.close()
+
+    def _apply_isolation(self, conn, item_id, valves):
+        """把阀号挂到在处置事件上；已被其他在处置事件占用的阀门不重复登记，只说明归属。"""
+        registered = []
+        skipped = []
+        for valve in valves:
+            row = conn.execute("SELECT * FROM valve_ledger WHERE valve_id=?", (valve,)).fetchone()
+            if row is not None and row["state"] == "closed":
+                owner = row["owner_item_id"]
+                if owner == item_id:
+                    registered.append(valve)
+                    continue
+                owner_row = conn.execute("SELECT status FROM items WHERE id=?", (owner,)).fetchone()
+                if owner_row is not None and owner_row["status"] not in rules.TERMINAL_STATUSES:
+                    skipped.append({"valve": valve, "owner_item_id": owner})
+                    continue
+            conn.execute(
+                "INSERT OR REPLACE INTO valve_ledger(valve_id,owner_item_id,state,acquired_at,released_at,released_by_item) VALUES(?,?,?,?,?,?)",
+                (valve, item_id, "closed", now_iso(), None, None),
+            )
+            registered.append(valve)
+        return {"registered": registered, "skipped": skipped}
+
+    def _apply_restore(self, conn, item_id, valves):
+        """只放开没有其他在处置事件占用的阀门；仍被占用的保持关闭并说明占用方。"""
+        occupancy = self._valve_occupancy(conn, exclude_item_id=item_id)
+        released = []
+        held = []
+        for valve in valves:
+            others = occupancy.get(valve, [])
+            if others:
+                held.append({"valve": valve, "held_by": others})
+                continue
+            row = conn.execute("SELECT valve_id FROM valve_ledger WHERE valve_id=?", (valve,)).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO valve_ledger(valve_id,owner_item_id,state,acquired_at,released_at,released_by_item) VALUES(?,?,?,?,?,?)",
+                    (valve, item_id, "open", now_iso(), now_iso(), item_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE valve_ledger SET state='open', released_at=?, released_by_item=? WHERE valve_id=?",
+                    (now_iso(), item_id, valve),
+                )
+            released.append(valve)
+        return {"released": released, "held": held}
+
+    def _valve_occupancy(self, conn, exclude_item_id=None):
+        """统计每台阀门仍被哪些在处置事件的阀序占用。"""
+        rows = conn.execute("SELECT id, status, payload FROM items").fetchall()
+        occupancy = {}
+        for row in rows:
+            if row["status"] in rules.TERMINAL_STATUSES:
+                continue
+            if exclude_item_id is not None and row["id"] == exclude_item_id:
+                continue
+            sequence = json.loads(row["payload"]).get("valve_sequence") or []
+            for valve in sequence:
+                occupancy.setdefault(valve, []).append(row["id"])
+        return occupancy
+
+    def valve_status(self, item_id, valves):
+        if not valves:
+            return []
+        conn = self.connect()
+        try:
+            occupancy = self._valve_occupancy(conn, exclude_item_id=item_id)
+            result = []
+            for valve in valves:
+                row = conn.execute("SELECT * FROM valve_ledger WHERE valve_id=?", (valve,)).fetchone()
+                entry = {
+                    "valve": valve,
+                    "state": row["state"] if row else "unregistered",
+                    "owner_item_id": row["owner_item_id"] if row else None,
+                }
+                others = occupancy.get(valve, [])
+                if others:
+                    entry["occupied_by"] = others
+                result.append(entry)
+            return result
+        finally:
+            conn.close()
+
+    def valve_ledger(self):
+        conn = self.connect()
+        try:
+            occupancy = self._valve_occupancy(conn)
+            rows = conn.execute("SELECT * FROM valve_ledger ORDER BY valve_id").fetchall()
+            result = []
+            for row in rows:
+                entry = dict(row)
+                entry["occupied_by"] = occupancy.get(row["valve_id"], [])
+                result.append(entry)
+            return {"valves": result}
         finally:
             conn.close()
 
