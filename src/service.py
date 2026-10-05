@@ -1,5 +1,5 @@
 from . import domain, rules
-from .domain import DomainError
+from .domain import ConflictError, DomainError
 
 
 class Service:
@@ -13,6 +13,7 @@ class Service:
             raise DomainError("forbidden", "当前角色不能创建此类业务记录", 403)
         normalized = domain.normalize_create(payload)
         stable_key = normalized.pop("_stable_key")
+        normalized["region"] = region
         return self.repository.create_item(
             rules.ENTITY_TYPE, stable_key, rules.INITIAL_STATUS, normalized, actor, role
         )
@@ -47,11 +48,21 @@ class Service:
         if rules.ENFORCE_REGION and action in rules.REGION_SENSITIVE_ACTIONS and region and role != "regulator":
             if item["payload"].get("region") != region:
                 raise DomainError("region_mismatch", "不能处理其他区域的记录", 403)
-        if action in rules.ACTION_REQUIRES_VERSION and expected_version is None:
-            raise DomainError("expected_version_required", "该操作需要 expected_version", 400)
+        if action in rules.ACTION_REQUIRES_VERSION:
+            if expected_version is None:
+                raise DomainError("expected_version_required", "该操作需要 expected_version", 400)
+            if int(expected_version) != int(item["version"]):
+                raise ConflictError("version_conflict", "记录已被其他操作更新，请重新读取")
         new_status, new_payload, event_payload = rules.apply_action(item, action, payload, actor, role)
+        valve_assign = None
+        valve_release = None
+        if action == "isolate":
+            valve_assign = new_payload.get("valve_sequence")
+        elif action == "restore":
+            valve_release = item["payload"].get("valve_sequence")
         self.repository.apply_action(
-            item_id, action, actor, role, new_status, new_payload, event_payload, expected_version
+            item_id, action, actor, role, new_status, new_payload, event_payload, expected_version,
+            valve_assign=valve_assign, valve_release=valve_release,
         )
         return self.get_item(item_id)
 

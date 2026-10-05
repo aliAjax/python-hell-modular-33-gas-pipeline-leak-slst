@@ -70,6 +70,14 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS valve_ledger (
+                    valve_id TEXT PRIMARY KEY,
+                    item_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'occupied',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(item_id) REFERENCES items(id)
+                );
                 """
             )
         finally:
@@ -207,7 +215,45 @@ class Repository:
         finally:
             conn.close()
 
-    def apply_action(self, item_id, action, actor, role, new_status, new_payload, event_payload, expected_version=None):
+    def list_valve_ledger(self):
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT vl.valve_id, vl.item_id, vl.status, vl.created_at, vl.updated_at, i.status AS item_status "
+                "FROM valve_ledger vl JOIN items i ON i.id=vl.item_id ORDER BY vl.valve_id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def _assign_valves(self, conn, item_id, valves):
+        for valve in valves:
+            row = conn.execute(
+                "SELECT vl.item_id, i.status FROM valve_ledger vl "
+                "JOIN items i ON i.id=vl.item_id "
+                "WHERE vl.valve_id=? AND vl.item_id!=? "
+                "AND i.status NOT IN ('restored','cancelled')",
+                (valve, item_id),
+            ).fetchone()
+            if row is not None:
+                raise ConflictError(
+                    "valve_occupied",
+                    "阀门 %s 已被在处置事件 #%s 占用，不能重复登记" % (valve, row["item_id"]),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO valve_ledger(valve_id,item_id,status,created_at,updated_at) "
+                "VALUES(?,?, 'occupied', ?, ?)",
+                (valve, item_id, now_iso(), now_iso()),
+            )
+
+    def _release_valves(self, conn, item_id, valves):
+        for valve in valves:
+            conn.execute(
+                "DELETE FROM valve_ledger WHERE valve_id=? AND item_id=?",
+                (valve, item_id),
+            )
+
+    def apply_action(self, item_id, action, actor, role, new_status, new_payload, event_payload, expected_version=None, valve_assign=None, valve_release=None):
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -216,6 +262,10 @@ class Repository:
                 raise NotFoundError("item_not_found", "业务实体不存在")
             if expected_version is not None and int(expected_version) != int(row["version"]):
                 raise ConflictError("version_conflict", "记录已被其他操作更新，请重新读取")
+            if valve_assign:
+                self._assign_valves(conn, item_id, valve_assign)
+            if valve_release:
+                self._release_valves(conn, item_id, valve_release)
             version = int(row["version"]) + 1
             conn.execute(
                 "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
@@ -256,6 +306,6 @@ class Repository:
             counts = {}
             for row in conn.execute("SELECT status, COUNT(*) AS total FROM items GROUP BY status").fetchall():
                 counts[row["status"]] = row["total"]
-            return {"counts": counts, "items": self.list_items()}
+            return {"counts": counts, "items": self.list_items(), "valve_ledger": self.list_valve_ledger()}
         finally:
             conn.close()
